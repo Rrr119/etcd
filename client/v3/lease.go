@@ -150,6 +150,23 @@ type Lease interface {
 	// In most of the cases, Keepalive should be used instead of KeepAliveOnce.
 	KeepAliveOnce(ctx context.Context, id LeaseID) (*LeaseKeepAliveResponse, error)
 
+	// KeepAliveOnceBatch renews multiple leases in a single LeaseKeepAlive
+	// stream instead of opening one stream per lease. The keep alive requests
+	// for all given lease IDs are merged into one round trip, and the responses
+	// are grouped by lease ID in the returned map.
+	//
+	// Duplicate lease IDs are deduplicated, so every requested lease ID appears
+	// at most once as a map key. An empty input returns an empty map without
+	// opening a stream.
+	//
+	// A lease that does not exist (or has already expired) is not a transport
+	// error: the server answers with TTL set to 0 and its response is still
+	// included in the map. Recoverable transport errors (e.g. Unavailable or
+	// Internal) are retried with a new stream, resending only the keep alive
+	// requests whose responses are still missing. The call returns the error
+	// once the error is not recoverable or the given context is canceled.
+	KeepAliveOnceBatch(ctx context.Context, ids []LeaseID) (map[LeaseID]*LeaseKeepAliveResponse, error)
+
 	// Close releases all resources Lease keeps for efficient communication
 	// with the etcd server.
 	Close() error
@@ -336,6 +353,134 @@ func (l *lessor) KeepAliveOnce(ctx context.Context, id LeaseID) (*LeaseKeepAlive
 			return nil, ContextError(ctx, err)
 		}
 	}
+}
+
+// KeepAliveOnceBatch renews the given leases over a single LeaseKeepAlive
+// stream, merging all keep alive requests into one round trip and grouping
+// the responses by lease ID. Recoverable stream errors are retried with a
+// fresh stream, resending only the requests without a response yet.
+func (l *lessor) KeepAliveOnceBatch(ctx context.Context, ids []LeaseID) (map[LeaseID]*LeaseKeepAliveResponse, error) {
+	respByID := make(map[LeaseID]*LeaseKeepAliveResponse, len(ids))
+
+	pending := uniqueLeaseIDs(ids)
+	for len(pending) > 0 {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+
+		got, err := l.keepAliveOnceBatch(ctx, pending)
+		for id, resp := range got {
+			respByID[id] = resp
+		}
+		if err != nil {
+			if isHaltErr(ctx, err) {
+				return nil, ContextError(ctx, err)
+			}
+			if l.lg != nil {
+				l.lg.Warn("retrying batch lease keep alive after recoverable error",
+					zap.Int("pending-leases", len(pending)),
+					zap.Error(err),
+				)
+			}
+			select {
+			case <-time.After(retryConnWait):
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
+
+		pending = remainingLeaseIDs(pending, respByID)
+	}
+
+	return respByID, nil
+}
+
+// keepAliveOnceBatch opens one LeaseKeepAlive stream, sends one keep alive
+// request per lease ID and returns every response received grouped by lease
+// ID. A broken stream may leave some leases without a response; the caller is
+// expected to retry those via KeepAliveOnceBatch.
+func (l *lessor) keepAliveOnceBatch(ctx context.Context, ids []LeaseID) (map[LeaseID]*LeaseKeepAliveResponse, error) {
+	cctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	stream, err := l.remote.LeaseKeepAlive(cctx, l.callOpts...)
+	if err != nil {
+		return nil, ContextError(ctx, err)
+	}
+
+	respByID := make(map[LeaseID]*LeaseKeepAliveResponse, len(ids))
+
+	// gRPC streams do not support concurrent Send calls, so sends run on a
+	// single goroutine. Sending concurrently with Recv avoids blocking on a
+	// half-open stream if the server answers or closes while requests are
+	// still being written.
+	sendDone := make(chan error, 1)
+	go func() {
+		var sendErr error
+		for _, id := range ids {
+			if serr := stream.Send(&pb.LeaseKeepAliveRequest{ID: int64(id)}); serr != nil {
+				sendErr = ContextError(ctx, serr)
+				break
+			}
+		}
+		if cerr := stream.CloseSend(); cerr != nil && sendErr == nil {
+			sendErr = ContextError(ctx, cerr)
+		}
+		sendDone <- sendErr
+	}()
+
+	var recvErr error
+	for len(respByID) < len(ids) {
+		resp, rerr := stream.Recv()
+		if rerr != nil {
+			recvErr = ContextError(ctx, rerr)
+			break
+		}
+
+		id := LeaseID(resp.ID)
+		if _, ok := respByID[id]; ok {
+			// duplicate response for a deduplicated lease ID; keep waiting
+			// for the remaining leases.
+			continue
+		}
+		respByID[id] = &LeaseKeepAliveResponse{
+			ResponseHeader: resp.GetHeader(),
+			ID:             id,
+			TTL:            resp.TTL,
+		}
+	}
+
+	sendErr := <-sendDone
+	if recvErr != nil {
+		return respByID, recvErr
+	}
+	return respByID, sendErr
+}
+
+// uniqueLeaseIDs returns ids with duplicates removed, preserving the order of
+// the first occurrence.
+func uniqueLeaseIDs(ids []LeaseID) []LeaseID {
+	seen := make(map[LeaseID]struct{}, len(ids))
+	unique := make([]LeaseID, 0, len(ids))
+	for _, id := range ids {
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		unique = append(unique, id)
+	}
+	return unique
+}
+
+// remainingLeaseIDs returns the leases from ids that have no response yet.
+func remainingLeaseIDs(ids []LeaseID, respByID map[LeaseID]*LeaseKeepAliveResponse) []LeaseID {
+	pending := make([]LeaseID, 0, len(ids))
+	for _, id := range ids {
+		if _, ok := respByID[id]; !ok {
+			pending = append(pending, id)
+		}
+	}
+	return pending
 }
 
 func (l *lessor) Close() error {

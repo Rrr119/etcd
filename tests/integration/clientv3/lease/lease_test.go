@@ -115,6 +115,94 @@ func TestLeaseKeepAliveOnce(t *testing.T) {
 	}
 }
 
+// TestLeaseKeepAliveOnceBatch ensures multiple leases are renewed in one
+// batch call and the responses are grouped by lease ID, including leases that
+// do not exist, which answer with TTL 0.
+func TestLeaseKeepAliveOnceBatch(t *testing.T) {
+	integration.BeforeTest(t)
+
+	clus := integration.NewCluster(t, &integration.ClusterConfig{Size: 3})
+	defer clus.Terminate(t)
+
+	lapi := clus.RandClient()
+
+	var ids []clientv3.LeaseID
+	for i := 0; i < 4; i++ {
+		resp, err := lapi.Grant(t.Context(), 10)
+		require.NoErrorf(t, err, "failed to create lease %v", err)
+		ids = append(ids, resp.ID)
+	}
+	missingID := clientv3.LeaseID(987654321)
+
+	// let the TTL tick down so a successful renewal becomes observable
+	time.Sleep(2 * time.Second)
+
+	// include duplicates to verify request de-duplication
+	reqIDs := []clientv3.LeaseID{ids[0], ids[1], ids[2], ids[3], ids[0], ids[2], missingID}
+	resps, err := lapi.KeepAliveOnceBatch(t.Context(), reqIDs)
+	require.NoErrorf(t, err, "failed to batch keepalive leases %v", err)
+
+	wantIDs := map[clientv3.LeaseID]struct{}{
+		ids[0]: {}, ids[1]: {}, ids[2]: {}, ids[3]: {}, missingID: {},
+	}
+	require.Lenf(t, resps, len(wantIDs), "expected one response per unique lease, got %d", len(resps))
+
+	for _, id := range ids {
+		resp, ok := resps[id]
+		require.Truef(t, ok, "missing keepalive response for lease %x", id)
+		require.Equalf(t, id, resp.ID, "response grouped under wrong lease ID")
+		require.Positivef(t, resp.TTL, "existing lease %x got non-positive TTL %d", id, resp.TTL)
+		require.NotNilf(t, resp.ResponseHeader, "missing response header")
+
+		// the server must have refreshed the TTL back to (close to) the grant
+		ttl, terr := lapi.TimeToLive(t.Context(), id)
+		require.NoErrorf(t, terr, "failed to fetch TTL for lease %x", id)
+		require.Greaterf(t, ttl.TTL, int64(7), "lease %x was not renewed, TTL=%d", id, ttl.TTL)
+	}
+
+	missingResp, ok := resps[missingID]
+	require.Truef(t, ok, "missing response for non-existent lease")
+	require.Equalf(t, missingID, missingResp.ID, "response grouped under wrong lease ID")
+	require.Zero(t, missingResp.TTL, "non-existent lease expected TTL 0")
+
+	// empty input must be a no-op without an error
+	empty, err := lapi.KeepAliveOnceBatch(t.Context(), nil)
+	require.NoError(t, err)
+	require.Empty(t, empty)
+}
+
+// TestLeaseKeepAliveOnceBatchSingleStream ensures a batch renewal of N
+// leases is multiplexed onto one server-side LeaseKeepAlive stream instead
+// of one stream per lease.
+func TestLeaseKeepAliveOnceBatchSingleStream(t *testing.T) {
+	integration.BeforeTest(t)
+
+	clus := integration.NewCluster(t, &integration.ClusterConfig{Size: 1, UseBridge: true})
+	defer clus.Terminate(t)
+
+	cli := clus.Client(0)
+
+	const leaseCount = 5
+	ids := make([]clientv3.LeaseID, 0, leaseCount)
+	for i := 0; i < leaseCount; i++ {
+		resp, err := cli.Grant(t.Context(), 30)
+		require.NoErrorf(t, err, "failed to create lease %v", err)
+		ids = append(ids, resp.ID)
+	}
+
+	// every handled LeaseKeepAlive stream completes once the client closes it
+	before := getLeaseKeepAliveMetric(t, clus.Members[0], "OK")
+
+	resps, err := cli.KeepAliveOnceBatch(t.Context(), ids)
+	require.NoErrorf(t, err, "failed to batch keepalive leases %v", err)
+	require.Len(t, resps, leaseCount)
+
+	require.Eventuallyf(t, func() bool {
+		return getLeaseKeepAliveMetric(t, clus.Members[0], "OK") == before+1
+	}, 5*time.Second, 100*time.Millisecond,
+		"batch renewal of %d leases must use a single LeaseKeepAlive stream", leaseCount)
+}
+
 func TestLeaseKeepAlive(t *testing.T) {
 	integration.BeforeTest(t)
 
